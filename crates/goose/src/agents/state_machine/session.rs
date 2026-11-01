@@ -143,7 +143,12 @@ impl EffectHandler<Session, GooseEffect> for SessionManager {
         for (index, effect) in effects.iter().enumerate() {
             match effect {
                 GooseEffect::Conversation(ConversationEffect::AppendMessage(message)) => {
-                    if contains_tool_confirmation_request(message) {
+                    // A provider-originated request (ACP) was already emitted live while the
+                    // provider streamed. Publishing it again would show its card twice, and
+                    // answering the second copy fails with "already answered".
+                    if contains_tool_confirmation_request(message)
+                        && message.metadata.inference.is_none()
+                    {
                         // Responses can arrive immediately, so publish only after the persistence pass.
                         emit.emit(AgentEvent::Message(message.clone()));
                     }
@@ -455,5 +460,62 @@ mod tests {
             .messages()
             .iter()
             .any(|message| message.id.as_deref() == Some("summary")));
+    }
+
+    fn confirmation(id: &str) -> Message {
+        Message::assistant().with_id(id).with_action_required(
+            id,
+            "shell".into(),
+            Default::default(),
+            None,
+        )
+    }
+
+    async fn published_confirmations(messages: Vec<Message>) -> Vec<String> {
+        let manager = SessionManager::new(tempfile::tempdir().unwrap().keep());
+        let session = manager
+            .create_session(
+                "/tmp".into(),
+                "approval card".into(),
+                SessionType::User,
+                GooseMode::Approve,
+            )
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let emit = Emitter::new(tx, tokio_util::sync::CancellationToken::new());
+        let mut effects: Vec<GooseEffect> = messages
+            .into_iter()
+            .map(|m| GooseEffect::Conversation(ConversationEffect::AppendMessage(m)))
+            .collect();
+        manager
+            .apply_effects(&session, &mut effects, &emit)
+            .await
+            .unwrap();
+        drop(emit);
+        let mut ids = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Message(m) = event {
+                ids.extend(m.id);
+            }
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn provider_tool_confirmation_is_not_published_again() {
+        let provider_request = confirmation("provider").with_inference_if_assistant(
+            crate::conversation::message::InferenceMetadata {
+                provider: "claude-acp".into(),
+                requested_model: "default".into(),
+                resolved_model: None,
+                provider_session_id: None,
+            },
+        );
+        let machine_request = confirmation("machine");
+
+        let published = published_confirmations(vec![provider_request, machine_request]).await;
+
+        assert_eq!(published, vec!["machine".to_string()]);
     }
 }
